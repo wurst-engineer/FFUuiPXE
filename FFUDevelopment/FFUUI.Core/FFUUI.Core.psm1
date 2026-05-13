@@ -981,8 +981,12 @@ function Get-FFUBuilderHyperVStatus {
     [CmdletBinding()]
     param()
 
+    # Determine if FFU is running on Server or Desktop OS
+    if ( (Get-ComputerInfo).osname -like "*server*") { $HVfeatureName = 'Microsoft-Hyper-V' }
+   else { $HVfeatureName = 'Microsoft-Hyper-V-All' }
+
     try {
-        $hyperVFeature = Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All -ErrorAction Stop
+        $hyperVFeature = Get-WindowsOptionalFeature -Online -FeatureName $HVfeatureName -ErrorAction Stop
         switch ([string]$hyperVFeature.State) {
             'Enabled' {
                 return [PSCustomObject]@{
