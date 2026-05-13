@@ -7,6 +7,20 @@ param (
     [string]$LogFile = "$PSScriptRoot\Create-PEMedia.log"
 )
 
+# Added function to set password and key
+function Set-SecurePW {
+    if ((-not (Test-Path "$FFUDevelopmentPath\WinPEDeployFFUFiles\Password.txt")) -and (-not (Test-Path "$FFUDevelopmentPath\WinPEDeployFFUFiles\AES.key"))) {
+        $KeyFile = "$FFUDevelopmentPath\WinPEDeployFFUFiles\AES.key"
+        $Key = New-Object Byte[] 32
+        [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($Key)
+        $Key | Out-File $KeyFile
+        $PasswordFile = "$FFUDevelopmentPath\WinPEDeployFFUFiles\Password.txt"
+        $Key = Get-Content $KeyFile
+        $Password = Read-Host -MaskInput -Prompt "Type your FFU Share Service Account password here" | ConvertTo-SecureString -AsPlainText -Force
+        $Password | ConvertFrom-SecureString -key $Key | Out-File $PasswordFile
+    }
+}
+
 function WriteLog($LogText) { 
     Add-Content -path $LogFile -value "$((Get-Date).ToString()) $LogText" -Force -ErrorAction SilentlyContinue
     Write-Verbose $LogText
@@ -120,6 +134,9 @@ function New-PEMedia {
         $PackagePathBase = "$adkPath`Assessment and Deployment Kit\Windows Preinstallation Environment\arm64\WinPE_OCs\"
     }
     
+    # Added call to function to set password
+    WriteLog "Setting PW for Deployment Share"
+    Set-SecurePW
 
     foreach ($Package in $Packages) {
         $PackagePath = Join-Path $PackagePathBase $Package
@@ -163,8 +180,73 @@ function New-PEMedia {
     }
     Invoke-Process $OSCDIMG $OSCDIMGArgs
     WriteLog "ISO created successfully"
+        # Export WIM before deleting WinPE folder
+    WriteLog 'Exporting boot wim'
+    Copy-Item "$WinPEFFUPath\media\sources\boot.wim" -Destination "$FFUDevelopmentPath\boot.wim" -Force | Out-Null
+
+    # Uploads new image to WDS if found
+      if ( (get-windowsfeature WDS-Deployment).InstallState -eq "Installed" ) {
+        $currentbootimg = (Get-WdsBootImage -ImageName "FFU UI" | ? Enabled -EQ "True" | select -first 1)
+        $bootwim = $FFUDevelopmentPath + "\boot.wim"
+        
+        # Checks for exiting image
+        if ( $currentbootimg -eq $null ) {
+            $ijob = {
+                Param($boot)
+                Import-WdsBootImage -Path $boot -NewImageName "FFU UI" -NewDescription "FFU UI" -DisplayOrder 500000
+                }
+                $i = Start-job -ScriptBlock $ijob -argumentlist $bootwim
+                Wait-job $i | Receive-job
+        }
+        
+        else { 
+            $oa = ""
+            while ($oa -notmatch '^[oa]$') {
+
+                Write-host "Existing Image found."
+                $oa = Read-Host "(O)verwrite or (A)ppend?"
+
+                if ($oa -eq 'o') { 
+                    $ojob = {
+                        Param($boot,$arch,$do)
+                        Remove-WdsBootImage -ImageName "FFU UI" -Architecture $arch
+                        Start-Sleep -seconds 30
+                        Import-WdsBootImage -Path $boot -NewImageName "FFU UI" -NewDescription "FFU UI" -DisplayOrder $do
+                        }
+                    $o = Start-Job -scriptblock $ojob -ArgumentList $bootwim,$WindowsArch,$currentbootimg.DisplayOrder
+                    Wait-Job $o | Receive-Job
+                    }
+                
+                elseif ( $oa -eq 'a') {
+                    $ajob = {
+                         Param($boot,$do)
+                         $do++
+                         Import-WdsBootImage -Path $boot -NewImageName "FFU UI" -NewDescription "FFU UI" -DisplayOrder $do
+                         }
+                    $a = Start-Job -scriptblock $ajob -ArgumentList $bootwim,$currentbootimg.DisplayOrder
+                    Wait-Job $a | Receive-Job
+                    }
+            }
+        }
+    # Comment the next line if you want to keep the resulting WIM file available after upload to WDS.
+    Remove-Item "$FFUDevelopmentPath\boot.wim" -Force
+    Write-host "Upload to WDS complete."
+    }
+    
+    Else {
+    WriteLog 'WDS not installed, preserving .wim'
+    Write-host "Be sure to upload your wim file to the WDS server"
+    }
+    
     WriteLog "Cleaning up $WinPEFFUPath"
     Remove-Item -Path "$WinPEFFUPath" -Recurse -Force
+
+    # Added lines to clean up password files
+    # Comment the remove-item line out if you are comfortable with leaving the password and key files intact.
+    WriteLog "Cleaning up password files"
+    Remove-Item -Path "$FFUDevelopmentPath\WinPEDeployFFUFiles\*" -Include "*.txt","*.key" -Exclude "*.ps1" -Force
+
     WriteLog 'Cleanup complete'
 }
+
 New-PEMedia
