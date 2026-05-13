@@ -1,18 +1,49 @@
-﻿function Get-USBDrive() {
-    $USBDriveLetter = (Get-Volume | Where-Object { $_.DriveType -eq 'Removable' -and $_.FileSystemType -eq 'NTFS' }).DriveLetter
-    if ($null -eq $USBDriveLetter) {
-        #Must be using a fixed USB drive - difficult to grab drive letter from win32_diskdrive. Assume user followed instructions and used Deploy as the friendly name for partition
-        $USBDriveLetter = (Get-Volume | Where-Object { $_.DriveType -eq 'Fixed' -and $_.FileSystemType -eq 'NTFS' -and $_.FileSystemLabel -eq 'Deploy' }).DriveLetter
-        #If we didn't get the drive letter, stop the script.
-        if ($null -eq $USBDriveLetter) {
-            $errorMessage = 'Cannot find USB drive letter. If using a fixed USB drive, name the deployment partition "Deploy".'
-            WriteLog ($errorMessage + ' Exiting.')
-            Stop-Script -Message $errorMessage
+﻿function Get-FFUShare() {
+    # Modify only these two variables
+    $FFUSharePath = '\\SET.TO.YOUR\DEPLOYMENT_SHARE'
+    $FFUShareUser = 'SVC_ACCOUNT\WITH_ACCESS_TO_SHARE'
+
+    # Set the FFU Share password in Create-PEMedia.ps1'
+
+    Write-SectionHeader -Title 'Connecting to Deployment Share'
+    $PasswordFile = "X:\Password.txt"
+    $KeyFile = "X:\AES.key"
+    $key = Get-Content $KeyFile
+    $FFUCredential = New-Object -TypeName System.Management.Automation.PSCredential -ArgumentList $FFUShareUser, (Get-Content $PasswordFile | ConvertTo-SecureString -Key $key)
+
+    # Ensure network operability
+    Start-Sleep -seconds 5
+    Write-Host 'Waiting for network connection...'
+    while (!(Test-Connection -ping 8.8.8.8 -Count 1 -Quiet -ErrorAction SilentlyContinue)) {
+        Write-Host 'Attempt failed. Retrying in 15 seconds...'
+        Start-Sleep -seconds 15
+        }
+        
+    Write-Host 'Network connection established!'
+    Write-Host 'Mapping Z to FFU Deployment Share...'
+
+    # Connect to network share
+    New-PSDrive -Name "Z" -PSProvider FileSystem -Root $FFUSharePath -Credential $FFUCredential -Scope Global | Out-Null
+    Remove-item $PasswordFile, $KeyFile -Force
+
+    # Copies unattend.xml file down to X: so the computername variable can be changed for synchronous multi-deploy
+    Copy-item -Path "$FFUSharePath\unattend\unattend.xml" -Destination "X:\unattend.xml" -Force
+
+    $FormatZ = (get-psdrive | ? Root -like "\\*").Name + ":\"
+        return $FormatZ
         }
 
-    }
-    $USBDriveLetter = $USBDriveLetter + ":\"
-    return $USBDriveLetter
+function LogBy-Serial() {
+    # Redirects Log file to allow multiple discrete logs on Deployment Share
+    $serial = (Get-CimInstance -ClassName win32_bios).SerialNumber.Trim()
+    $LogDir = $USBDrive + "logs\" + $serial
+    if (Test-Path -Path $LogDir) { WriteLog "System previously imaged, using existing folder." }
+    else { New-Item -path $LogDir -ItemType Directory -Force | Out-Null }
+    $NewLogFileName = 'ScriptLog.txt'
+    $NewLogFile = $LogDir + "\" + $NewLogFileName
+    Move-item $LogFile $NewLogFile -Force -ErrorAction Continue
+    Start-Sleep -seconds 5
+    return $NewLogFile
 }
 
 function Get-HardDrive() {
@@ -41,59 +72,6 @@ function WriteLog($LogText) {
     Add-Content -path $LogFile -value "$((Get-Date).ToString()) $LogText"
 }
 
-function Read-MenuSelection {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Prompt,
-
-        [Parameter(Mandatory = $true)]
-        [string]$InvalidInputMessage,
-
-        [Parameter()]
-        [int[]]$ValidSelections,
-
-        [Parameter()]
-        [int]$Minimum = [int]::MinValue,
-
-        [Parameter()]
-        [int]$Maximum = [int]::MaxValue,
-
-        [Parameter()]
-        [switch]$AllowSkip
-    )
-
-    do {
-        $userInput = Read-Host $Prompt
-        if ([string]::IsNullOrWhiteSpace($userInput)) {
-            Write-Host $InvalidInputMessage
-            continue
-        }
-
-        $selection = 0
-        if (-not [int]::TryParse($userInput, [ref]$selection)) {
-            Write-Host $InvalidInputMessage
-            continue
-        }
-
-        if ($AllowSkip -and $selection -eq 0) {
-            return 0
-        }
-
-        if ($PSBoundParameters.ContainsKey('ValidSelections')) {
-            if ($ValidSelections -notcontains $selection) {
-                Write-Host $InvalidInputMessage
-                continue
-            }
-        }
-        elseif ($selection -lt $Minimum -or $selection -gt $Maximum) {
-            Write-Host $InvalidInputMessage
-            continue
-        }
-
-        return $selection
-    } until ($false)
-}
-
 function Set-DiskpartAnswerFiles($DiskpartFile, $DiskID) {
     (Get-Content $DiskpartFile).Replace('disk 0', "disk $DiskID") | Set-Content -Path $DiskpartFile
 }
@@ -115,68 +93,6 @@ function Set-Computername($computername) {
     }
     $xml.Save($UnattendFile)
     return $computername
-}
-
-function Get-UnattendComputerNameValue {
-    if ($null -eq $UnattendFile) {
-        return $null
-    }
-
-    [xml]$xml = Get-Content $UnattendFile
-    foreach ($component in $xml.unattend.settings.component) {
-        if ($component.ComputerName) {
-            return [string]$component.ComputerName
-        }
-    }
-
-    return $null
-}
-
-function Test-LegacyPromptComputerName($computername) {
-    if ([string]::IsNullOrWhiteSpace($computername)) {
-        return $false
-    }
-
-    $normalizedName = $computername.Trim().ToLowerInvariant()
-    return $normalizedName -in @('mycomputer', 'default')
-}
-
-function Get-NormalizedComputerName($computername) {
-    if ([string]::IsNullOrWhiteSpace($computername)) {
-        throw 'Computer name cannot be empty.'
-    }
-
-    $normalizedName = ($computername -replace "\s", '').Trim()
-    if ([string]::IsNullOrWhiteSpace($normalizedName)) {
-        throw 'Computer name cannot be empty after removing spaces.'
-    }
-
-    if ($normalizedName.Length -gt 15) {
-        $normalizedName = $normalizedName.Substring(0, 15)
-    }
-
-    return $normalizedName
-}
-
-function Resolve-ComputerNameTemplate($computerNameTemplate, $serialNumber) {
-    if ([string]::IsNullOrWhiteSpace($computerNameTemplate)) {
-        throw 'Computer name template cannot be empty.'
-    }
-
-    $resolvedName = $computerNameTemplate -replace '(?i)%serial%', $serialNumber
-    if ($resolvedName -match '%') {
-        throw 'Unsupported device name variable found. Only %serial% is supported.'
-    }
-
-    return Get-NormalizedComputerName($resolvedName)
-}
-
-function Set-ConfiguredComputerName($computername) {
-    $normalizedName = Get-NormalizedComputerName($computername)
-    $normalizedName = Set-Computername($normalizedName)
-    Writelog "Computer name will be set to $normalizedName"
-    Write-Host "Computer name will be set to $normalizedName"
-    return $normalizedName
 }
 
 function Invoke-Process {
@@ -828,7 +744,7 @@ function Stop-Script {
         Write-Error -Message $Message
     }
     WriteLog "Copying dism log to $USBDrive"
-    Invoke-Process xcopy "X:\Windows\logs\dism\dism.log $USBDrive /Y" 
+    Invoke-Process xcopy "X:\Windows\logs\dism\dism.log $LogDir /Y" 
     WriteLog "Copying dism log to $USBDrive succeeded"
     Read-Host "Press Enter to exit"
     Exit
@@ -944,13 +860,13 @@ function Remove-DriverSubstMapping {
         WriteLog "Failed to remove SUBST drive $($driveName): $_"
     }
 }
-        
+
 #Get USB Drive and create log file
 $LogFileName = 'ScriptLog.txt'
-$USBDrive = Get-USBDrive
+$USBDrive = Get-FFUShare
 New-item -Path $USBDrive -Name $LogFileName -ItemType "file" -Force | Out-Null
 $LogFile = $USBDrive + $LogFilename
-$version = '2604.1'
+$version = '2603.2'
 WriteLog 'Begin Logging'
 WriteLog "Script version: $version"
 
@@ -1006,7 +922,21 @@ else {
     }
     $displayList | Format-Table -AutoSize -Property Disk, 'Size (GB)', Sector, 'Bus Type', Model
 
-    $diskSelection = Read-MenuSelection -Prompt 'Enter the disk number to apply the FFU to' -InvalidInputMessage 'Invalid disk number. Please select from the available disks.' -ValidSelections $validDiskIndexes
+    do {
+        try {
+            $var = $true
+            [int]$diskSelection = Read-Host 'Enter the disk number to apply the FFU to'
+        }
+        catch {
+            Write-Host 'Input was not in correct format. Please enter a valid disk number'
+            $var = $false
+        }
+        # Validate selected disk is in the list of available disks
+        if ($var -and $validDiskIndexes -notcontains $diskSelection) {
+            Write-Host "Invalid disk number. Please select from the available disks."
+            $var = $false
+        }
+    } until ($var)
 
     $selectedDisk = $diskDriveCandidates | Where-Object { $_.Index -eq $diskSelection }
     WriteLog "Disk selection: DiskNumber=$($selectedDisk.Index), Model=$($selectedDisk.Model), SizeGB=$([math]::Round(($selectedDisk.Size / 1GB), 2)), BusType=$($selectedDisk.InterfaceType)"
@@ -1034,9 +964,15 @@ WriteLog "DiskNumber is $DiskID with size $diskSizeGB GB"
 $sysInfoObject = Get-SystemInformation -HardDrive $hardDrive
 Write-SystemInformation -SystemInformation $sysInfoObject
 
+# Calling LogBy-Serial Function
+Write-SectionHeader -Title 'Updating Log Directory'
+$LogFile= LogBy-Serial
+$LogDir= Get-ItemProperty $LogFile | select -expandproperty directory
+Write-Host `n'Logs for this deployment redirected to'$LogDir`n -ForegroundColor DarkCyan
+
 #Find FFU Files
 Write-SectionHeader 'FFU File Selection'
-[array]$FFUFiles = @(Get-ChildItem -Path $USBDrive*.ffu)
+[array]$FFUFiles = @(Get-ChildItem -Path $USBDrive\FFU\*.ffu)
 $FFUCount = $FFUFiles.Count
 
 #If multiple FFUs found, ask which to install
@@ -1050,8 +986,18 @@ If ($FFUCount -gt 1) {
         $array += New-Object PSObject -Property $Properties
     }
     $array | Format-Table -AutoSize -Property Number, FFUFile | Out-Host
-    $FFUSelected = Read-MenuSelection -Prompt 'Enter the FFU number to install' -InvalidInputMessage 'Input was not in correct format. Please enter a valid FFU number.' -Minimum 1 -Maximum $FFUCount
-    $FFUSelected = $FFUSelected - 1
+    do {
+        try {
+            $var = $true
+            [int]$FFUSelected = Read-Host 'Enter the FFU number to install'
+            $FFUSelected = $FFUSelected - 1
+        }
+
+        catch {
+            Write-Host 'Input was not in correct format. Please enter a valid FFU number'
+            $var = $false
+        }
+    } until (($FFUSelected -le $FFUCount - 1) -and $var) 
 
     $FFUFileToInstall = $array[$FFUSelected].FFUFile
     WriteLog "$FFUFileToInstall was selected"
@@ -1079,6 +1025,15 @@ If (Test-Path -Path $APFolder) {
     }
 }
 
+#FindBIOScustom
+$BIOSfolder = $USBDrive + "BIOS\" + $sysinfoobject.ManufacturerNormalized + "\"
+If (Test-Path -Path $BIOSfolder) {
+    [array]$BiosFiles = @(Get-ChildItem -Path $BIOSFolder*.exe)
+    $BIOSFilesCount = $BIOSFiles.Count
+    if ($BIOSFilesCount -ge 1) {
+        $bioscustom = $true
+    }
+}
 
 #FindPPKG
 $PPKGFolder = $USBDrive + "PPKG\"
@@ -1092,7 +1047,7 @@ if (Test-Path -Path $PPKGFolder) {
 
 #FindUnattend
 $UnattendFolder = $USBDrive + "unattend\"
-$UnattendFilePath = $UnattendFolder + "unattend.xml"
+$UnattendFilePath = "X:\unattend.xml"
 $UnattendPrefixPath = $UnattendFolder + "prefixes.txt"
 $UnattendComputerNamePath = $UnattendFolder + "SerialComputerNames.csv"
 If (Test-Path -Path $UnattendFilePath) {
@@ -1114,26 +1069,13 @@ If (Test-Path -Path $UnattendComputerNamePath) {
     }
 }
 
-$UnattendConfiguredComputerName = $null
-$RequiresLegacyDeviceNamePrompt = $false
-$RequiresTemplateDeviceName = $false
-if ($Unattend) {
-    $UnattendConfiguredComputerName = Get-UnattendComputerNameValue
-    $RequiresLegacyDeviceNamePrompt = Test-LegacyPromptComputerName($UnattendConfiguredComputerName)
-    if (-not [string]::IsNullOrWhiteSpace($UnattendConfiguredComputerName) -and $UnattendConfiguredComputerName -match '(?i)%serial%') {
-        $RequiresTemplateDeviceName = $true
-    }
-}
-
-#Ask for device name if naming is explicitly required
-If ($UnattendPrefix -or $UnattendComputerName -or $RequiresTemplateDeviceName -or $RequiresLegacyDeviceNamePrompt) {
+#Ask for device name if unattend exists
+If ($Unattend -or $UnattendPrefix -or $UnattendComputerName) {
     Write-SectionHeader 'Device Name Selection'
     if ($Unattend -and $UnattendPrefix) {
         Writelog 'Unattend file found with prefixes.txt. Getting prefixes.'
         $UnattendPrefixes = @(Get-content $UnattendPrefixFile)
         $UnattendPrefixCount = $UnattendPrefixes.Count
-        $skipPrefixSelection = $false
-        $PrefixToUse = $null
         If ($UnattendPrefixCount -gt 1) {
             WriteLog "Found $UnattendPrefixCount Prefixes"
             $array = @()
@@ -1142,18 +1084,20 @@ If ($UnattendPrefix -or $UnattendComputerName -or $RequiresTemplateDeviceName -o
                 $array += New-Object PSObject -Property $Properties
             }
             $array | Format-Table -AutoSize -Property Number, DeviceNamePrefix
-            $prefixSelection = Read-MenuSelection -Prompt 'Enter the prefix number to use for the device name (0 to skip)' -InvalidInputMessage 'Input was not in correct format. Please enter 0 to skip or a valid prefix number.' -Minimum 1 -Maximum $UnattendPrefixCount -AllowSkip
-            if ($prefixSelection -eq 0) {
-                $skipPrefixSelection = $true
-                WriteLog 'User chose to skip device name prefix selection. Existing unattend computer name will remain unchanged.'
-                Write-Host "`nDevice name prefix selection was skipped. The existing unattend computer name will remain unchanged."
-            }
-            else {
-                $PrefixSelected = $prefixSelection - 1
-                $PrefixToUse = $array[$PrefixSelected].DeviceNamePrefix
-                WriteLog "$PrefixToUse was selected"
-                Write-Host "`n$PrefixToUse was selected as device name prefix"
-            }
+            do {
+                try {
+                    $var = $true
+                    [int]$PrefixSelected = Read-Host 'Enter the prefix number to use for the device name'
+                    $PrefixSelected = $PrefixSelected - 1
+                }
+                catch {
+                    Write-Host 'Input was not in correct format. Please enter a valid prefix number'
+                    $var = $false
+                }
+            } until (($PrefixSelected -le $UnattendPrefixCount - 1) -and $var) 
+            $PrefixToUse = $array[$PrefixSelected].DeviceNamePrefix
+            WriteLog "$PrefixToUse was selected"
+            Write-Host "`n$PrefixToUse was selected as device name prefix"
         }
         elseif ($UnattendPrefixCount -eq 1) {
             WriteLog "Found $UnattendPrefixCount Prefix"
@@ -1162,11 +1106,27 @@ If ($UnattendPrefix -or $UnattendComputerName -or $RequiresTemplateDeviceName -o
             WriteLog "Will use $PrefixToUse as device name prefix"
             Write-Host "Will use $PrefixToUse as device name prefix"
         }
-        if (-not $skipPrefixSelection) {
-            $serial = (Get-CimInstance -ClassName win32_bios).SerialNumber.Trim()
-            $computername = Set-ConfiguredComputerName($PrefixToUse + $serial)
+        <#
+        #Get serial number to append. This can make names longer than 15 characters. Trim any leading or trailing whitespace
+        $serial = (Get-CimInstance -ClassName win32_bios).SerialNumber.Trim()
+        #Combine prefix with serial
+        $computername = ($PrefixToUse + $serial) -replace "\s", "" # Remove spaces because windows does not support spaces in the computer names
+        #If computername is longer than 15 characters, reduce to 15. Sysprep/unattend doesn't like ComputerName being longer than 15 characters even though Windows accepts it
+        If ($computername.Length -gt 15) {
+            $computername = $computername.substring(0, 15)
         }
-    }
+        $computername = Set-Computername($computername)
+        Writelog "Computer name will be set to $computername"
+        Write-Host "Computer name will be set to $computername"
+        #>
+    	if ($UnattendPrefix -eq $true) {
+                [string]$computername = Read-Host 'Enter Asset Tag'
+                $fullcompname = $PrefixToUse + $computername
+                Set-Computername($fullcompname)
+                Writelog "Computer name will be set to $fullcompname"
+                Write-Host "Computer name will be set to $fullcompname"
+                }
+        }
     elseif ($Unattend -and $UnattendComputerName) {
         Writelog 'Unattend file found with SerialComputerNames.csv. Getting name for current computer.'
         $SerialComputerNames = Import-Csv -Path $UnattendComputerNameFile.FullName -Delimiter ","
@@ -1175,30 +1135,31 @@ If ($UnattendPrefix -or $UnattendComputerName -or $RequiresTemplateDeviceName -o
         $SCName = $SerialComputerNames | Where-Object { $_.SerialNumber -eq $SerialNumber }
 
         If ($SCName) {
-            [string]$computername = Set-ConfiguredComputerName($SCName.ComputerName)
+            [string]$computername = $SCName.ComputerName
+            $computername = Set-Computername($computername)
+            Writelog "Computer name will be set to $computername"
+            Write-Host "Computer name will be set to $computername"
         }
         else {
             Writelog 'No matching serial number found in SerialComputerNames.csv. Setting random computer name to complete setup.'
             Write-Host 'No matching serial number found in SerialComputerNames.csv. Setting random computer name to complete setup.'
-            [string]$computername = Set-ConfiguredComputerName(("FFU-" + ( -join ((48..57) + (65..90) + (97..122) | Get-Random -Count 11 | ForEach-Object { [char]$_ }))))
+            [string]$computername = ("FFU-" + ( -join ((48..57) + (65..90) + (97..122) | Get-Random -Count 11 | ForEach-Object { [char]$_ })))
+            $computername = Set-Computername($computername)
+            Writelog "Computer name will be set to $computername"
+            Write-Host "Computer name will be set to $computername"
         }
     }
-    elseif ($Unattend -and $RequiresTemplateDeviceName) {
-        Writelog 'Unattend file found with a %serial% computer name template. Resolving the template.'
-        $serialNumber = (Get-CimInstance -ClassName Win32_Bios).SerialNumber.Trim()
-        [string]$computername = Set-ConfiguredComputerName((Resolve-ComputerNameTemplate -computerNameTemplate $UnattendConfiguredComputerName -serialNumber $serialNumber))
-    }
-    elseif ($Unattend -and $RequiresLegacyDeviceNamePrompt) {
+    elseif ($Unattend) {
         Writelog 'Unattend file found with no prefixes.txt, asking for name'
         Write-Host 'Unattend file found but no prefixes.txt. Please enter a device name.'
-        [string]$computername = Set-ConfiguredComputerName((Read-Host 'Enter device name'))
+        [string]$computername = Read-Host 'Enter device name'
+        $computername = Set-Computername($computername)
+        Writelog "Computer name will be set to $computername"
+        Write-Host "Computer name will be set to $computername"
     }
     else {
         WriteLog 'Device naming assets detected without unattend.xml. Skipping device naming prompts.'
     }
-}
-elseif ($Unattend) {
-    WriteLog 'Unattend file found. Device naming is not required, but unattend settings will still be applied.'
 }
 else {
     WriteLog 'No unattend folder found. Device name will be set via PPKG, AP JSON, or default OS name.'
@@ -1208,7 +1169,17 @@ else {
 If ($autopilot -eq $true -and $PPKG -eq $true) {
     WriteLog 'Both PPKG and Autopilot json files found'
     Write-Host 'Both Autopilot JSON files and Provisioning packages were found.'
-    $APorPPKG = Read-MenuSelection -Prompt 'Enter 1 for Autopilot or 2 for Provisioning Package' -InvalidInputMessage 'Incorrect value. Please enter 1 for Autopilot or 2 for Provisioning Package.' -Minimum 1 -Maximum 2
+    do {
+        try {
+            $var = $true
+            [int]$APorPPKG = Read-Host 'Enter 1 for Autopilot or 2 for Provisioning Package'
+        }
+
+        catch {
+            Write-Host 'Incorrect value. Please enter 1 for Autopilot or 2 for Provisioning Package'
+            $var = $false
+        }
+    } until (($APorPPKG -gt 0 -and $APorPPKG -lt 3) -and $var)
     If ($APorPPKG -eq 1) {
         $PPKG = $false
     }
@@ -1216,6 +1187,45 @@ If ($autopilot -eq $true -and $PPKG -eq $true) {
         $autopilot = $false
     } 
 }
+
+#If multiple BIOS customization files found, ask which to configure
+If ($BIOSFilesCount -gt 1 -and $bioscustom -eq $true) {
+    WriteLog "Found $BIOSFilesCount custom BIOS Files for"$sysinfoobject.ManufacturerNormalized
+    Write-Host "Found $BIOSFilesCount custom BIOS Files for"$sysinfoobject.ManufacturerNormalized
+    $array = @()
+
+    for ($i = 0; $i -le $BIOSFilesCount - 1; $i++) {
+        $Properties = [ordered]@{Number = $i + 1 ; BIOSFile = $BIOSFiles[$i].FullName; BIOSFileName = $BIOSFiles[$i].Name }
+        $array += New-Object PSObject -Property $Properties
+    }
+    $array | Format-Table -AutoSize -Property Number, BIOSFileName
+    do {
+        try {
+            $var = $true
+            [int]$BIOSFileSelected = Read-Host 'Enter the custom BIOS file number to configure'
+            $BIOSFileSelected = $BIOSFileSelected - 1
+        }
+
+        catch {
+            Write-Host 'Input was not in correct format. Please enter a valid BIOS config file number'
+            $var = $false
+        }
+    } until (($BIOSFileSelected -le $BIOSFilesCount - 1) -and $var) 
+
+    $BIOSFileToInstall = $array[$BIOSFileSelected].BIOSFile
+    $BIOSFileName = $array[$BIOSFileSelected].BIOSFileName
+    WriteLog "$BIOSFileToInstall was selected"
+}
+elseif ($BIOSFilesCount -eq 1 -and $bioscustom -eq $true) {
+    WriteLog "Found $BIOSFilesCount AP File"
+    $BIOSFileToInstall = $BIOSFiles[0].FullName
+    $BIOSFileName = $BIOSFiles[0].Name
+    WriteLog "$BIOSFileToInstall will be configured"
+} 
+else {
+    Writelog 'No custom BIOS found or BIOS customization was not selected'
+}
+
 
 #If multiple AP json files found, ask which to install
 If ($APFilesCount -gt 1 -and $autopilot -eq $true) {
@@ -1227,20 +1237,22 @@ If ($APFilesCount -gt 1 -and $autopilot -eq $true) {
         $array += New-Object PSObject -Property $Properties
     }
     $array | Format-Table -AutoSize -Property Number, APFileName
-    $APFileSelection = Read-MenuSelection -Prompt 'Enter the AP json file number to install (0 to skip)' -InvalidInputMessage 'Input was not in correct format. Please enter 0 to skip or a valid AP json file number.' -Minimum 1 -Maximum $APFilesCount -AllowSkip
+    do {
+        try {
+            $var = $true
+            [int]$APFileSelected = Read-Host 'Enter the AP json file number to install'
+            $APFileSelected = $APFileSelected - 1
+        }
 
-    if ($APFileSelection -eq 0) {
-        $APFileToInstall = $null
-        $APFileName = $null
-        WriteLog 'User chose to skip Autopilot JSON selection.'
-        Write-Host "`nAutopilot JSON selection was skipped."
-    }
-    else {
-        $APFileSelected = $APFileSelection - 1
-        $APFileToInstall = $array[$APFileSelected].APFile
-        $APFileName = $array[$APFileSelected].APFileName
-        WriteLog "$APFileToInstall was selected"
-    }
+        catch {
+            Write-Host 'Input was not in correct format. Please enter a valid AP json file number'
+            $var = $false
+        }
+    } until (($APFileSelected -le $APFilesCount - 1) -and $var) 
+
+    $APFileToInstall = $array[$APFileSelected].APFile
+    $APFileName = $array[$APFileSelected].APFileName
+    WriteLog "$APFileToInstall was selected"
 }
 elseif ($APFilesCount -eq 1 -and $autopilot -eq $true) {
     WriteLog "Found $APFilesCount AP File"
@@ -1263,19 +1275,22 @@ If ($PPKGFilesCount -gt 1 -and $PPKG -eq $true) {
         $array += New-Object PSObject -Property $Properties
     }
     $array | Format-Table -AutoSize -Property Number, PPKGFileName
-    $PPKGFileSelection = Read-MenuSelection -Prompt 'Enter the PPKG file number to install (0 to skip)' -InvalidInputMessage 'Input was not in correct format. Please enter 0 to skip or a valid PPKG file number.' -Minimum 1 -Maximum $PPKGFilesCount -AllowSkip
+    do {
+        try {
+            $var = $true
+            [int]$PPKGFileSelected = Read-Host 'Enter the PPKG file number to install'
+            $PPKGFileSelected = $PPKGFileSelected - 1
+        }
 
-    if ($PPKGFileSelection -eq 0) {
-        $PPKGFileToInstall = $null
-        WriteLog 'User chose to skip Provisioning Package selection.'
-        Write-Host "`nProvisioning Package selection was skipped."
-    }
-    else {
-        $PPKGFileSelected = $PPKGFileSelection - 1
-        $PPKGFileToInstall = $array[$PPKGFileSelected].PPKGFile
-        WriteLog "$PPKGFileToInstall was selected"
-        Write-Host "`n$PPKGFileToInstall will be used"
-    }
+        catch {
+            Write-Host 'Input was not in correct format. Please enter a valid PPKG file number'
+            $var = $false
+        }
+    } until (($PPKGFileSelected -le $PPKGFilesCount - 1) -and $var) 
+
+    $PPKGFileToInstall = $array[$PPKGFileSelected].PPKGFile
+    WriteLog "$PPKGFileToInstall was selected"
+    Write-Host "`n$PPKGFileToInstall will be used"
 }
 elseif ($PPKGFilesCount -eq 1 -and $PPKG -eq $true) {
     Write-SectionHeader -Title 'Provisioning Package Selection'
@@ -1391,7 +1406,7 @@ if ($null -eq $DriverSourcePath) {
                     if ([string]::IsNullOrWhiteSpace($relativeSegment)) {
                         return Split-Path -Path $normalizedPath -Leaf
                     }
-                    return $relativeSegment
+                    return $relativePath = $relativeSegment
                 }
                 return $normalizedPath
             }
@@ -1467,17 +1482,25 @@ if ($null -eq $DriverSourcePath) {
                     }
                 }
                 $displayArray | Format-Table -Property Number, Type, RelativePath -AutoSize
-
+                
                 $DriverSelected = -1
                 $skipDriverInstall = $false
-                $userSelection = Read-MenuSelection -Prompt 'Enter the number of the driver source to install (0 to skip)' -InvalidInputMessage 'Input was not in correct format. Please enter 0 to skip or a valid number.' -Minimum 1 -Maximum $DriverSourcesCount -AllowSkip
-                if ($userSelection -eq 0) {
-                    $skipDriverInstall = $true
-                }
-                else {
-                    $DriverSelected = $userSelection - 1
-                }
-
+                do {
+                    try {
+                        $var = $true
+                        [int]$userSelection = Read-Host 'Enter the number of the driver source to install (0 to skip)'
+                        if ($userSelection -eq 0) {
+                            $skipDriverInstall = $true
+                            break
+                        }
+                        $DriverSelected = $userSelection - 1
+                    }
+                    catch {
+                        Write-Host 'Input was not in correct format. Please enter a valid number.'
+                        $var = $false
+                    }
+                } until ((($DriverSelected -ge 0 -and $DriverSelected -lt $DriverSourcesCount) -or $skipDriverInstall) -and $var)
+                
                 if ($skipDriverInstall) {
                     $DriverSourcePath = $null
                     $DriverSourceType = $null
@@ -1616,32 +1639,80 @@ If ($APFileToInstall) {
         throw $_
     }
 }
+
+#Customizing BIOS
+If ($BIOSFileToInstall) {
+Write-SectionHeader -Title 'Applying Custom BIOS settings'
+    If ($sysinfoobject.ManufacturerNormalized -eq "Dell" ) {
+        WriteLog "Preparing to apply custom $sysInfoObject.Manufacturer BIOS settings"
+        Write-Host "Preparing to apply custom $sysInfoObject.Manufacturer BIOS settings"
+        WriteLog "Extracting $BIOSFileToInstall to $env:temp"
+        Write-host "Extracting $BIOSFileToInstall to $env:temp"
+        Start-Process -filepath $BIOSFileToInstall -argumentlist "/s /e=$env:temp /l=$LogDir\cctk-extract.log" -Wait
+             try {
+                # Once exe is extracted, BIOS password is available in cleartext.  Setting all BIIOS settings then setting PW
+                $trycurrentpw= (get-content $env:temp\config.ini | select-string -pattern "ValSetupPwd*").line.split('=') | select -last 1
+                $p1 = Start-Process -filepath "$env:temp\X86_64\cctk.exe" -argumentlist "-i","$env:temp\config.ini","-l $LogDir\cctk.log","--valsetuppwd=`"$trycurrentpw`"" -wait -passthru
+                $p2 = Start-Process -filepath "$env:temp\X86_64\cctk.exe" -argumentlist "--setuppwd=`"$trycurrentpw`"","-l=$LogDir\cctk.log" -wait -passthru
+                    # Want set password result to display and log before the try-catch has a chance to pass exit code
+                    if ( $p2.exitcode -eq 41) {
+                    WriteLog "BIOS Password previously set."
+                    Write-Host "BIOS Password previously set."
+                    }
+                    if ( ($p1.exitcode -ne 0) -and ($p1.exitcode -ne 146)) {
+                    Write-host "$p1.exitcode"		
+                    Throw "Errorlevel $p1.exitcode"
+                    }
+                    if ( ($p2.exitcode -ne 0) -and ($p2.exitcode -ne 41)) {
+                    Write-host "$p2.exitcode"
+                    Throw "Errorlevel $p2.exitcode"
+                    }
+                WriteLog "Applying $BIOSFileToInstall succeeded"
+                Write-Host "Applying $BIOSFileToInstall succeeded"
+             }
+             catch {
+                    # Record Dell BIOS Exit Code
+                    Write-host "Apply CCTK settings failure code:" $($p1.exitcode)
+                    WriteLog "Apply CCTK settings failure code:" $($p1.exitcode)
+                    Write-host "Apply BIOS password failure code:" $($p2.exitcode)
+                    WriteLog "Apply BIOS password failure code:" $($p2.exitcode)             
+                    Write-host "See $LogDir\cctk.log for more info."
+                    WriteLog "See $LogDir\cctk.log for more info."
+             }
+        }
+    If ($sysinfoobject.ManufacturerNormalized -eq "HP" ) {
+        WriteLog "Preparing to apply custom $sysinfoobject.ManufacturerNormalized BIOS settings"
+        Write-Host "Preparing to apply custom $sysinfoobject.ManufacturerNormalized BIOS settings"
+        #Do more for HP
+        }
+    }
 #Apply PPKG
 If ($PPKGFileToInstall) {
     Write-SectionHeader -Title 'Applying Provisioning Package'
+    $PPKGtarget = "W:\ProgramData\Microsoft\Provisioning"
+
     try {
         #Make sure to delete any existing PPKG on the USB drive
         Get-Childitem -Path $USBDrive\*.ppkg | ForEach-Object {
             Remove-item -Path $_.FullName
         }
-        WriteLog "Copying $PPKGFileToInstall to $USBDrive"
-        Write-Host "Copying $PPKGFileToInstall to $USBDrive"
+        WriteLog "Copying $PPKGFileToInstall to $PPKGtarget"
+        Write-Host "Copying $PPKGFileToInstall to $PPKGtarget"
         # Quote paths to handle PPKG filenames with spaces
-        Invoke-process xcopy.exe """$PPKGFileToInstall"" ""$USBDrive"""
-        WriteLog "Copying $PPKGFileToInstall to $USBDrive succeeded"
-        Write-Host "Copying $PPKGFileToInstall to $USBDrive succeeded"
+        Invoke-process xcopy.exe """$PPKGFileToInstall"" ""W:\ProgramData\Microsoft\Provisioning"""
+        WriteLog "Copying $PPKGFileToInstall to $PPKGtarget succeeded"
+        Write-Host "Copying $PPKGFileToInstall to $PPKGtarget succeeded"
     }
 
     catch {
-        Writelog "Copying $PPKGFileToInstall to $USBDrive failed with error: $_"
-        Write-Host "Copying $PPKGFileToInstall to $USBDrive failed with error: $_"
+        Writelog "Copying $PPKGFileToInstall to $PPKGtarget failed with error: $_"
+        Write-Host "Copying $PPKGFileToInstall to $PPKGtarget failed with error: $_"
         throw $_
     }
 }
 #Set DeviceName
-If ($Unattend) {
-    $unattendSectionTitle = if ($computername) { 'Applying Computer Name and Unattend Configuration' } else { 'Applying Unattend Configuration' }
-    Write-SectionHeader -Title $unattendSectionTitle
+If ($computername) {
+    Write-SectionHeader -Title 'Applying Computer Name and Unattend Configuration'
     try {
         $PantherDir = 'w:\windows\panther'
         If (Test-Path -Path $PantherDir) {
@@ -1662,8 +1733,8 @@ If ($Unattend) {
         }
     }
     catch {
-        WriteLog 'Copying Unattend.xml to Panther failed'
-        Stop-Script -Message "Copying Unattend.xml to Panther failed with error: $_"
+        WriteLog "Copying Unattend.xml to name device failed"
+        Stop-Script -Message "Copying Unattend.xml to name device failed with error: $_"
     }   
 }
 
@@ -1682,8 +1753,14 @@ if ($null -ne $DriverSourcePath) {
             # Mount the driver WIM read-only so DISM can recurse the extracted INF tree
             WriteLog "Mounting WIM contents to $TempDriverDir"
             Write-Host "Mounting WIM contents to $TempDriverDir"
+
             # For some reason can't use /mount-image with invoke-process, so using dism.exe directly
-            dism.exe /Mount-Image /ImageFile:$DriverSourcePath /Index:1 /MountDir:$TempDriverDir /ReadOnly /optimize
+            #dism.exe /Mount-Image /ImageFile:$DriverSourcePath /Index:1 /MountDir:$TempDriverDir /ReadOnly /optimize
+
+            #Added this lines as workaround to allow copy from PSDrive
+            $dsp= gci $DriverSourcePath | select -ExpandProperty $target.FullName
+            dism.exe /Mount-Image /ImageFile:$dsp /Index:1 /MountDir:$TempDriverDir /ReadOnly /optimize
+
             $mountExitCode = $LASTEXITCODE
             if ($mountExitCode -ne 0) {
                 throw "DISM WIM mount failed. LastExitCode = $mountExitCode."
@@ -1705,7 +1782,7 @@ if ($null -ne $DriverSourcePath) {
                 $setupApiLogPath = 'W:\Windows\INF\setupapi.offline.log'
                 if (Test-Path -Path $setupApiLogPath) {
                     try {
-                        Invoke-Process xcopy.exe """$setupApiLogPath"" ""$USBDrive"" /Y"
+                        Invoke-Process xcopy.exe """$setupApiLogPath"" ""$LogDir"" /Y"
                     }
                     catch {
                         WriteLog "Warning: Failed to copy setupapi.offline.log to $USBDrive. "
@@ -1727,7 +1804,7 @@ if ($null -ne $DriverSourcePath) {
 
             # Copy troubleshooting logs to the USB drive when driver installation fails
             try {
-                Invoke-Process cmd.exe "/c copy /Y ""X:\Windows\logs\dism\dism.log"" ""$($USBDrive)dism_driverinject.log"""
+                Invoke-Process cmd.exe "/c copy /Y ""X:\Windows\logs\dism\dism.log"" ""$($LogDir)\dism_driverinject.log"""
             }
             catch {
                 WriteLog "Warning: Failed to copy dism.log to $USBDrive."
@@ -1736,7 +1813,7 @@ if ($null -ne $DriverSourcePath) {
             $setupApiLogPath = 'W:\Windows\INF\setupapi.offline.log'
             if (Test-Path -Path $setupApiLogPath) {
                 try {
-                    Invoke-Process xcopy.exe """$setupApiLogPath"" ""$USBDrive"" /Y"
+                    Invoke-Process xcopy.exe """$setupApiLogPath"" ""$LogDir"" /Y"
                 }
                 catch {
                     WriteLog "Warning: Failed to copy setupapi.offline.log to $USBDrive."
@@ -1780,15 +1857,16 @@ if ($null -ne $DriverSourcePath) {
     elseif ($DriverSourceType -eq 'Folder') {
         $substMapping = $null
         try {
-            # Use SUBST to shorten long paths for DISM /Add-Driver
-            $substMapping = New-DriverSubstMapping -SourcePath $DriverSourcePath
-            $shortDriverPath = $substMapping.DrivePath
-            WriteLog "Injecting drivers from folder via SUBST. Source: $DriverSourcePath, Mapped: $($substMapping.DriveName)"
-            Write-Host "Injecting drivers from folder: $shortDriverPath"
+            # Remapping DriverSourcePath onto dsp for use with PSDrive
+            $dsp= Get-ItemProperty $DriverSourcePath | select -ExpandProperty FullName
+            #$substMapping = New-DriverSubstMapping -SourcePath $DriverSourcePath
+            #$shortDriverPath = $substMapping.DrivePath
+            WriteLog "Injecting drivers from folder Source: "$dsp""
+            Write-Host "Injecting drivers from folder: "$dsp""
             Write-Host "This may take a while, please be patient."
 
             # Inject drivers into the offline Windows image; failures here should not stop deployment
-            $driverInjectExitCode = Invoke-Process -FilePath dism.exe -ArgumentList "/image:W:\ /Add-Driver /Driver:$shortDriverPath /Recurse" -IgnoreExitCode -PassThruExitCode
+            $driverInjectExitCode = Invoke-Process -FilePath dism.exe -ArgumentList "/image:W:\ /Add-Driver /Driver:""$dsp"" /Recurse" -IgnoreExitCode -PassThruExitCode
             if ($driverInjectExitCode -ne 0) {
                 $warningMessage = "Warning: One or more drivers failed to inject from folder. ExitCode = $driverInjectExitCode. Continuing deployment."
                 WriteLog $warningMessage
@@ -1798,7 +1876,7 @@ if ($null -ne $DriverSourcePath) {
                 $setupApiLogPath = 'W:\Windows\INF\setupapi.offline.log'
                 if (Test-Path -Path $setupApiLogPath) {
                     try {
-                        Invoke-Process xcopy.exe """$setupApiLogPath"" ""$USBDrive"" /Y"
+                        Invoke-Process xcopy.exe """$setupApiLogPath"" ""$LogDir"" /Y"
                     }
                     catch {
                         WriteLog "Warning: Failed to copy setupapi.offline.log to $USBDrive. "
@@ -1820,7 +1898,7 @@ if ($null -ne $DriverSourcePath) {
 
             # Copy troubleshooting logs to the USB drive when driver installation fails
             try {
-                Invoke-Process xcopy.exe "X:\Windows\logs\dism\dism.log $USBDrive /Y"
+                Invoke-Process xcopy.exe "X:\Windows\logs\dism\dism.log $LogDir /Y"
             }
             catch {
                 WriteLog "Warning: Failed to copy dism.log to $USBDrive."
@@ -1829,7 +1907,7 @@ if ($null -ne $DriverSourcePath) {
             $setupApiLogPath = 'W:\Windows\INF\setupapi.offline.log'
             if (Test-Path -Path $setupApiLogPath) {
                 try {
-                    Invoke-Process xcopy.exe """$setupApiLogPath"" ""$USBDrive"" /Y"
+                    Invoke-Process xcopy.exe """$setupApiLogPath"" ""$LogDir"" /Y"
                 }
                 catch {
                     WriteLog "Warning: Failed to copy setupapi.offline.log to $USBDrive."
@@ -1857,6 +1935,34 @@ if ($null -ne $DriverSourcePath) {
 else {
     WriteLog "No drivers to install."
 }
+
+# Copy PostOOBE Content
+$PostOOBEfolder = $USBDrive + "PostOOBE\"
+If (Test-Path -Path $PostOOBEfolder) {
+    [array]$PostOOBEFiles = @(Get-ChildItem -Path $PostOOBEFolder)
+    $PostOOBEFilesCount = $PostOOBEFiles.Count
+
+    if ($PostOOBEFilesCount -ge 1) {
+    Write-SectionHeader -Title 'Applying Post OOBE Customization'
+    $PostOOBEtarget = "W:\Windows\Setup\Scripts"
+    New-Item $PostOOBEtarget -ItemType Directory -force
+
+        try {
+            WriteLog "Copying Post OOBE folder contents $PostOOBEtarget"
+            Write-Host "Copying Post OOBE folder contents $PostOOBEtarget"
+            Copy-Item $PostOOBEFolder* $PostOOBEtarget
+            WriteLog "Copying Post OOBE folder contents to $PostOOBEtarget succeeded"
+            Write-Host "Copying Post OOBE folder contents to $PostOOBEtarget succeeded"
+        }
+
+        catch {
+            Writelog "Copying Post OOBE folder contents to $PostOOBEtarget failed with error: $_"
+            Write-Host "Copying Post OOBE folder contents to $PostOOBEtarget failed with error: $_"
+            throw $_
+        }
+    }
+}
+
 Write-SectionHeader -Title 'Setting Boot Configuration'
 WriteLog "Setting Windows Boot Manager to be first in the firmware display order."
 Write-Host "Setting Windows Boot Manager to be first in the firmware display order."
@@ -1866,9 +1972,6 @@ Write-Host "Setting Windows Boot Manager to be first in the default display orde
 Invoke-Process bcdedit.exe "/set {bootmgr} displayorder {default} /addfirst"
 #Copy DISM log to USBDrive
 WriteLog "Copying dism log to $USBDrive"
-invoke-process xcopy "X:\Windows\logs\dism\dism.log $USBDrive /Y" 
+invoke-process xcopy "X:\Windows\logs\dism\dism.log $LogDir /Y" 
 WriteLog "Copying dism log to $USBDrive succeeded"
-
-
-
 
